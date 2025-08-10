@@ -54,7 +54,7 @@ The extension maintains a WebSocket connection to Pushbullet's servers to receiv
 
 ### Auto-open Links
 
-When enabled (default), links sent directly to your Chrome device will automatically open in a new tab. You can disable this feature in the extension's settings.
+When enabled (default), links sent directly to your Chrome device will automatically open in a new tab. The background service now initializes on browser start for more reliable auto-opening. You can disable this feature in the extension's settings.
 
 ## Privacy
 
