@@ -28,13 +28,18 @@ let sessionCache = {
 // Initialize extension
 chrome.runtime.onInstalled.addListener(() => {
   console.log('Pushbullet extension installed');
-  
+
   // Set up context menu
   setupContextMenu();
-  
-  // Initialize session cache
+});
+
+// Initialize session cache when Chrome starts
+chrome.runtime.onStartup.addListener(() => {
   initializeSessionCache();
 });
+
+// Ensure session cache is initialized when the service worker is loaded
+initializeSessionCache();
 
 // Initialize session cache
 async function initializeSessionCache() {
