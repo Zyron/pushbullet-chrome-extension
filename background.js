@@ -13,6 +13,10 @@ let websocket = null;
 let reconnectAttempts = 0;
 let reconnectTimeout = null;
 let autoOpenLinks = true; // Default to true for auto opening links
+let lastAutoOpenedPushTimestamp = 0; // Track the last push we auto-opened
+const MAX_STORED_AUTO_OPENED_IDENS = 50;
+let autoOpenedPushIdens = new Set();
+let autoOpenedPushIdensList = [];
 
 // Session cache for quick popup loading
 let sessionCache = {
@@ -48,7 +52,7 @@ async function initializeSessionCache() {
   try {
     // Get API key from storage
     const result = await new Promise(resolve => {
-      chrome.storage.local.get(['apiKey', 'deviceIden', 'autoOpenLinks', 'deviceNickname'], resolve);
+      chrome.storage.local.get(['apiKey', 'deviceIden', 'autoOpenLinks', 'deviceNickname', 'lastAutoOpenedPushTimestamp', 'autoOpenedPushIdens'], resolve);
     });
     
     apiKey = result.apiKey;
@@ -58,10 +62,19 @@ async function initializeSessionCache() {
       autoOpenLinks = result.autoOpenLinks;
       sessionCache.autoOpenLinks = autoOpenLinks;
     }
-    
+
     if (result.deviceNickname) {
       deviceNickname = result.deviceNickname;
       sessionCache.deviceNickname = deviceNickname;
+    }
+
+    if (result.lastAutoOpenedPushTimestamp !== undefined) {
+      lastAutoOpenedPushTimestamp = result.lastAutoOpenedPushTimestamp;
+    }
+
+    if (Array.isArray(result.autoOpenedPushIdens)) {
+      autoOpenedPushIdensList = result.autoOpenedPushIdens.slice(0, MAX_STORED_AUTO_OPENED_IDENS);
+      autoOpenedPushIdens = new Set(autoOpenedPushIdensList);
     }
     
     if (apiKey) {
@@ -76,7 +89,16 @@ async function initializeSessionCache() {
       // Fetch recent pushes
       const pushes = await fetchRecentPushes();
       sessionCache.recentPushes = pushes;
-      
+
+      // On first run, seed the last auto-open timestamp to avoid opening historical pushes
+      if (result.lastAutoOpenedPushTimestamp === undefined && pushes.length > 0) {
+        lastAutoOpenedPushTimestamp = getPushTimestamp(pushes[0]);
+        chrome.storage.local.set({ lastAutoOpenedPushTimestamp });
+      }
+
+      // Auto-open any new link pushes that arrived while we were offline
+      processPushesForAutoOpen(pushes);
+
       // Update session cache
       sessionCache.isAuthenticated = true;
       sessionCache.lastUpdated = Date.now();
@@ -171,9 +193,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     autoOpenLinks = message.autoOpenLinks;
     sessionCache.autoOpenLinks = autoOpenLinks;
     console.log('Auto-open links setting updated:', autoOpenLinks);
-    
+
     // Save to storage
     chrome.storage.local.set({ autoOpenLinks: autoOpenLinks });
+
+    if (autoOpenLinks) {
+      processPushesForAutoOpen(sessionCache.recentPushes);
+    }
   } else if (message.action === 'deviceNicknameChanged') {
     // Update device nickname
     deviceNickname = message.deviceNickname;
@@ -208,7 +234,9 @@ async function refreshSessionCache() {
       // Fetch recent pushes
       const pushes = await fetchRecentPushes();
       sessionCache.recentPushes = pushes;
-      
+
+      processPushesForAutoOpen(pushes);
+
       // Update session cache
       sessionCache.isAuthenticated = true;
       sessionCache.lastUpdated = Date.now();
@@ -550,22 +578,12 @@ function connectWebSocket() {
                 console.log('No popup open to receive push updates');
               });
               
-              // Check if there's a new push
+              // Check for any pushes that should trigger auto-open
+              processPushesForAutoOpen(pushes);
+
+              // Show notification for the newest push (if available)
               if (pushes.length > 0) {
-                const latestPush = pushes[0];
-                
-                // Show notification for the new push
-                showPushNotification(latestPush);
-                
-                // Auto-open link if enabled and the push is a link
-                // Skip if the push is from this device
-                if (autoOpenLinks && 
-                    latestPush.type === 'link' && 
-                    latestPush.url && 
-                    latestPush.source_device_iden !== deviceIden) {
-                  console.log('Auto-opening link:', latestPush.url);
-                  chrome.tabs.create({ url: latestPush.url });
-                }
+                showPushNotification(pushes[0]);
               }
             });
           }
@@ -590,18 +608,9 @@ function connectWebSocket() {
               });
             }
             
-            // Show notification for the new push
+            // Auto-open if needed and show notification for the new push
+            processPushesForAutoOpen([data.push]);
             showPushNotification(data.push);
-            
-            // Auto-open link if enabled and the push is a link
-            // Skip if the push is from this device
-            if (autoOpenLinks && 
-                data.push.type === 'link' && 
-                data.push.url && 
-                data.push.source_device_iden !== deviceIden) {
-              console.log('Auto-opening link:', data.push.url);
-              chrome.tabs.create({ url: data.push.url });
-            }
           }
           break;
         case 'nop':
@@ -655,7 +664,10 @@ async function refreshPushes() {
     const pushes = await fetchRecentPushes();
     sessionCache.recentPushes = pushes;
     sessionCache.lastUpdated = Date.now();
-    
+
+    // Process any pushes that should auto-open as part of this refresh
+    processPushesForAutoOpen(pushes);
+
     // Notify popup of updated pushes
     chrome.runtime.sendMessage({
       action: 'pushesUpdated',
@@ -670,6 +682,104 @@ async function refreshPushes() {
     console.error('Error refreshing pushes:', error);
     throw error;
   }
+}
+
+// Determine whether a push should trigger an auto-open and handle it if necessary
+function processPushesForAutoOpen(pushes) {
+  if (!autoOpenLinks || !pushes) {
+    return;
+  }
+
+  const pushArray = Array.isArray(pushes) ? pushes : [pushes];
+
+  // Collect pushes that qualify for auto-opening and haven't been handled yet
+  const pushesToOpen = pushArray.filter(shouldAutoOpenPush);
+
+  if (pushesToOpen.length === 0) {
+    return;
+  }
+
+  // Open in chronological order so older pushes appear first when multiple queued up
+  pushesToOpen
+    .sort((a, b) => getPushTimestamp(a) - getPushTimestamp(b))
+    .forEach(openPushLink);
+}
+
+function shouldAutoOpenPush(push) {
+  if (!autoOpenLinks || !push) {
+    return false;
+  }
+
+  if (push.dismissed) {
+    return false;
+  }
+
+  if (push.type !== 'link' || !push.url) {
+    return false;
+  }
+
+  // Skip pushes originating from this device to avoid loops
+  if (push.source_device_iden && deviceIden && push.source_device_iden === deviceIden) {
+    return false;
+  }
+
+  if (push.iden && autoOpenedPushIdens.has(push.iden)) {
+    return false;
+  }
+
+  // Only open pushes directed to this device (or broadcast pushes with no explicit target)
+  if (push.target_device_iden && deviceIden && push.target_device_iden !== deviceIden) {
+    return false;
+  }
+
+  const pushTimestamp = getPushTimestamp(push);
+
+  // Skip pushes we've already processed
+  if (pushTimestamp < lastAutoOpenedPushTimestamp) {
+    return false;
+  }
+
+  return true;
+}
+
+function openPushLink(push) {
+  console.log('Auto-opening link:', push.url);
+
+  chrome.tabs.create({ url: push.url }, () => {
+    if (chrome.runtime.lastError) {
+      console.error('Error opening tab for push:', chrome.runtime.lastError);
+    }
+  });
+
+  const pushTimestamp = getPushTimestamp(push);
+  lastAutoOpenedPushTimestamp = Math.max(lastAutoOpenedPushTimestamp, pushTimestamp);
+
+  if (push.iden) {
+    if (!autoOpenedPushIdens.has(push.iden)) {
+      autoOpenedPushIdens.add(push.iden);
+      autoOpenedPushIdensList.push(push.iden);
+
+      if (autoOpenedPushIdensList.length > MAX_STORED_AUTO_OPENED_IDENS) {
+        const excess = autoOpenedPushIdensList.length - MAX_STORED_AUTO_OPENED_IDENS;
+        const removedIdens = autoOpenedPushIdensList.splice(0, excess);
+        removedIdens.forEach(id => autoOpenedPushIdens.delete(id));
+      }
+    }
+  }
+
+  chrome.storage.local.set({
+    lastAutoOpenedPushTimestamp,
+    autoOpenedPushIdens: autoOpenedPushIdensList
+  });
+}
+
+function getPushTimestamp(push) {
+  if (!push) {
+    return 0;
+  }
+
+  // "modified" is updated whenever the push changes, fall back to created time
+  return push.modified || push.created || 0;
 }
 
 // Show notification for a push
@@ -837,7 +947,7 @@ chrome.storage.onChanged.addListener((changes, namespace) => {
       } else {
         // Disconnect WebSocket
         disconnectWebSocket();
-        
+
         // Clear session cache
         sessionCache = {
           userInfo: null,
@@ -848,6 +958,10 @@ chrome.storage.onChanged.addListener((changes, namespace) => {
           autoOpenLinks: true,
           deviceNickname: 'Chrome' // Default nickname
         };
+
+        lastAutoOpenedPushTimestamp = 0;
+        autoOpenedPushIdens.clear();
+        autoOpenedPushIdensList = [];
       }
     }
     
@@ -857,12 +971,29 @@ chrome.storage.onChanged.addListener((changes, namespace) => {
       sessionCache.autoOpenLinks = autoOpenLinks;
       console.log('Auto-open links setting updated from storage:', autoOpenLinks);
     }
-    
+
     // Handle device nickname change
     if (changes.deviceNickname) {
       deviceNickname = changes.deviceNickname.newValue;
       sessionCache.deviceNickname = deviceNickname;
       console.log('Device nickname updated from storage:', deviceNickname);
     }
+
+    if (changes.lastAutoOpenedPushTimestamp) {
+      lastAutoOpenedPushTimestamp = changes.lastAutoOpenedPushTimestamp.newValue || 0;
+      console.log('Last auto-opened push timestamp updated from storage:', lastAutoOpenedPushTimestamp);
+    }
+
+    if (changes.autoOpenedPushIdens) {
+      if (Array.isArray(changes.autoOpenedPushIdens.newValue)) {
+        autoOpenedPushIdensList = changes.autoOpenedPushIdens.newValue.slice(0, MAX_STORED_AUTO_OPENED_IDENS);
+        autoOpenedPushIdens = new Set(autoOpenedPushIdensList);
+        console.log('Auto-opened push id list updated from storage');
+      } else if (changes.autoOpenedPushIdens.newValue === undefined) {
+        autoOpenedPushIdensList = [];
+        autoOpenedPushIdens.clear();
+        console.log('Auto-opened push id list cleared from storage');
+      }
+    }
   }
-}); 
+});

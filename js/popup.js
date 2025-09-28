@@ -342,7 +342,7 @@ function logout() {
   // Disconnect WebSocket if connected
   disconnectWebSocket();
   
-  chrome.storage.local.remove(['apiKey', 'deviceIden'], () => {
+  chrome.storage.local.remove(['apiKey', 'deviceIden', 'lastAutoOpenedPushTimestamp', 'autoOpenedPushIdens'], () => {
     apiKey = null;
     hasInitialized = false;
     showSection('login');
