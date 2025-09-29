@@ -39,6 +39,26 @@ let autoOpenLinks = true; // Default to true for auto opening links
 let websocket = null;
 let hasInitialized = false;
 
+// Fire-and-forget helper for background messages so rejections stay silent when the service worker is asleep
+function sendMessageToBackground(message, contextLabel) {
+  try {
+    const maybePromise = chrome.runtime.sendMessage(message);
+
+    if (maybePromise && typeof maybePromise.catch === 'function') {
+      maybePromise.catch((err) => {
+        if (err?.message?.includes('Receiving end does not exist')) {
+          console.log(`Background not ready for ${contextLabel || 'message'}`);
+          return;
+        }
+
+        console.error(`Error sending message${contextLabel ? ` (${contextLabel})` : ''}:`, err);
+      });
+    }
+  } catch (err) {
+    console.error(`Failed to dispatch message${contextLabel ? ` (${contextLabel})` : ''}:`, err);
+  }
+}
+
 // Initialize popup
 document.addEventListener('DOMContentLoaded', async () => {
   console.log('Popup DOM loaded');
@@ -253,10 +273,10 @@ function setupEventListeners() {
     chrome.storage.local.set({ autoOpenLinks: autoOpenLinks });
     
     // Notify background script
-    chrome.runtime.sendMessage({ 
-      action: 'autoOpenLinksChanged', 
-      autoOpenLinks: autoOpenLinks 
-    });
+    sendMessageToBackground({
+      action: 'autoOpenLinksChanged',
+      autoOpenLinks: autoOpenLinks
+    }, 'autoOpenLinksChanged');
   });
 }
 
@@ -293,11 +313,11 @@ async function saveApiKey() {
       deviceNickname = newNickname;
       
       // Notify background script about API key and nickname change
-      chrome.runtime.sendMessage({ 
-        action: 'apiKeyChanged', 
+      sendMessageToBackground({
+        action: 'apiKeyChanged',
         apiKey: newApiKey,
         deviceNickname: newNickname
-      });
+      }, 'apiKeyChanged');
       
       try {
         await initializeAuthenticated();
@@ -328,10 +348,10 @@ function updateDeviceNickname() {
     deviceNickname = newNickname;
     
     // Notify background script
-    chrome.runtime.sendMessage({ 
-      action: 'deviceNicknameChanged', 
-      deviceNickname: newNickname 
-    });
+    sendMessageToBackground({
+      action: 'deviceNicknameChanged',
+      deviceNickname: newNickname
+    }, 'deviceNicknameChanged');
     
     showStatus('Device nickname updated successfully!', 'success');
   });
