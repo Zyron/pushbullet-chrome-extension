@@ -184,6 +184,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         recentPushes: sessionCache.recentPushes,
         autoOpenLinks: sessionCache.autoOpenLinks,
         deviceNickname: sessionCache.deviceNickname
+      }).catch(err => {
+        // This is expected to reject when no listeners are registered (e.g., popup closed)
+        if (err?.message?.includes('Receiving end does not exist')) {
+          console.log('No popup open to receive session updates');
+          return;
+        }
+
+        console.error('Error delivering session update message:', err);
       });
     }).catch(error => {
       console.error('Error refreshing session cache after API key change:', error);
@@ -620,8 +628,17 @@ function connectWebSocket() {
       }
     };
     
-    websocket.onerror = (error) => {
-      console.error('WebSocket error in background:', error);
+    websocket.onerror = (event) => {
+      const message = event?.error?.message || event?.message || event?.type || 'Unknown WebSocket error';
+      const readyState = event?.target?.readyState;
+      const url = event?.target?.url;
+
+      console.error('WebSocket error in background:', {
+        message,
+        readyState,
+        url,
+        raw: event
+      });
     };
     
     websocket.onclose = (event) => {
