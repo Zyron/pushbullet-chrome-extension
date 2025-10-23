@@ -630,7 +630,23 @@ function connectWebSocket() {
     };
     
     websocket.onmessage = async (event) => {
-      const data = JSON.parse(event.data);
+      let data;
+
+      try {
+        data = JSON.parse(event.data);
+      } catch (error) {
+        console.error('Failed to parse WebSocket message:', {
+          raw: event?.data,
+          error
+        });
+        return;
+      }
+
+      if (!data || typeof data !== 'object') {
+        console.warn('Ignoring unexpected WebSocket payload:', data);
+        return;
+      }
+
       console.log('WebSocket message received in background:', data);
       
       // Handle different message types
@@ -640,7 +656,9 @@ function connectWebSocket() {
             console.log('Push tickle received, fetching latest pushes');
             
             // Fetch latest pushes
-            fetchRecentPushes().then(pushes => {
+            try {
+              const pushes = await fetchRecentPushes();
+
               // Update session cache
               sessionCache.recentPushes = pushes;
               sessionCache.lastUpdated = Date.now();
@@ -661,7 +679,9 @@ function connectWebSocket() {
               if (pushes.length > 0) {
                 showPushNotification(pushes[0]);
               }
-            });
+            } catch (error) {
+              console.error('Error refreshing pushes after tickle:', error);
+            }
           }
           break;
         case 'push':
