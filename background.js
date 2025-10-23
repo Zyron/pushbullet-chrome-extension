@@ -4,6 +4,9 @@ const PUSHES_URL = `${API_BASE_URL}/pushes`;
 const DEVICES_URL = `${API_BASE_URL}/devices`;
 const USER_INFO_URL = `${API_BASE_URL}/users/me`;
 const WEBSOCKET_URL = 'wss://stream.pushbullet.com/websocket/';
+const KEEP_ALIVE_ALARM_NAME = 'pushbulletKeepAlive';
+const KEEP_ALIVE_PERIOD_MINUTES = 1;
+const KEEP_ALIVE_REFRESH_INTERVAL_MS = 60000;
 
 // Global variables
 let apiKey = null;
@@ -17,6 +20,7 @@ let lastAutoOpenedPushTimestamp = 0; // Track the last push we auto-opened
 const MAX_STORED_AUTO_OPENED_IDENS = 50;
 let autoOpenedPushIdens = new Set();
 let autoOpenedPushIdensList = [];
+let keepAliveRefreshInProgress = false;
 
 // Session cache for quick popup loading
 let sessionCache = {
@@ -35,15 +39,19 @@ chrome.runtime.onInstalled.addListener(() => {
 
   // Set up context menu
   setupContextMenu();
+
+  ensureKeepAliveAlarm();
 });
 
 // Initialize session cache when Chrome starts
 chrome.runtime.onStartup.addListener(() => {
+  ensureKeepAliveAlarm();
   initializeSessionCache();
 });
 
 // Ensure session cache is initialized when the service worker is loaded
 initializeSessionCache();
+ensureKeepAliveAlarm();
 
 // Initialize session cache
 async function initializeSessionCache() {
@@ -117,6 +125,17 @@ async function initializeSessionCache() {
     console.error('Error initializing session cache:', error);
     sessionCache.isAuthenticated = false;
   }
+}
+
+function ensureKeepAliveAlarm() {
+  if (!chrome?.alarms) {
+    return;
+  }
+
+  chrome.alarms.create(KEEP_ALIVE_ALARM_NAME, {
+    delayInMinutes: KEEP_ALIVE_PERIOD_MINUTES,
+    periodInMinutes: KEEP_ALIVE_PERIOD_MINUTES
+  });
 }
 
 // Listen for messages from popup
@@ -223,6 +242,55 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   
   // Return true to indicate we'll respond asynchronously
   return true;
+});
+
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (alarm.name !== KEEP_ALIVE_ALARM_NAME) {
+    return;
+  }
+
+  ensureKeepAliveAlarm();
+
+  if (!apiKey) {
+    console.log('Keep-alive alarm skipped: API key not set');
+    return;
+  }
+
+  if (!sessionCache.isAuthenticated) {
+    console.log('Keep-alive alarm reinitializing session cache');
+    initializeSessionCache().catch(error => {
+      console.error('Error reinitializing session cache from keep-alive alarm:', error);
+    });
+    return;
+  }
+
+  const readyState = websocket ? websocket.readyState : WebSocket.CLOSED;
+
+  if (!websocket || (readyState !== WebSocket.OPEN && readyState !== WebSocket.CONNECTING)) {
+    console.log('Keep-alive alarm reconnecting WebSocket');
+    connectWebSocket();
+  }
+
+  if (keepAliveRefreshInProgress) {
+    return;
+  }
+
+  const lastUpdated = sessionCache.lastUpdated || 0;
+  const isCacheStale = Date.now() - lastUpdated > KEEP_ALIVE_REFRESH_INTERVAL_MS;
+
+  if (!isCacheStale) {
+    return;
+  }
+
+  keepAliveRefreshInProgress = true;
+
+  try {
+    await refreshPushes();
+  } catch (error) {
+    console.error('Error refreshing pushes during keep-alive:', error);
+  } finally {
+    keepAliveRefreshInProgress = false;
+  }
 });
 
 // Refresh session cache
