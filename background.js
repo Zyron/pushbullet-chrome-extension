@@ -7,6 +7,7 @@ const WEBSOCKET_URL = 'wss://stream.pushbullet.com/websocket/';
 const KEEP_ALIVE_ALARM_NAME = 'pushbulletKeepAlive';
 const KEEP_ALIVE_PERIOD_MINUTES = 1;
 const KEEP_ALIVE_REFRESH_INTERVAL_MS = 60000;
+const textDecoder = typeof TextDecoder === 'function' ? new TextDecoder() : null;
 
 // Global variables
 let apiKey = null;
@@ -630,14 +631,48 @@ function connectWebSocket() {
     };
     
     websocket.onmessage = async (event) => {
+      const rawPayload = event?.data;
+      let payloadText;
+
+      if (typeof rawPayload === 'string') {
+        payloadText = rawPayload;
+      } else if (rawPayload instanceof ArrayBuffer) {
+        if (!textDecoder) {
+          console.error('TextDecoder not available to read ArrayBuffer WebSocket payload');
+          return;
+        }
+        payloadText = textDecoder.decode(rawPayload);
+      } else if (rawPayload instanceof Blob) {
+        try {
+          payloadText = await rawPayload.text();
+        } catch (error) {
+          console.error('Failed to read Blob WebSocket payload:', {
+            error: error?.message || error,
+            raw: rawPayload
+          });
+          return;
+        }
+      } else if (rawPayload === null || rawPayload === undefined) {
+        console.warn('Received empty WebSocket payload');
+        return;
+      } else {
+        console.warn('Ignoring unsupported WebSocket payload type:', typeof rawPayload);
+        return;
+      }
+
+      if (!payloadText || typeof payloadText !== 'string') {
+        console.warn('Ignoring non-string WebSocket payload after decoding');
+        return;
+      }
+
       let data;
 
       try {
-        data = JSON.parse(event.data);
+        data = JSON.parse(payloadText);
       } catch (error) {
         console.error('Failed to parse WebSocket message:', {
-          raw: event?.data,
-          error
+          raw: payloadText,
+          error: error?.message || error
         });
         return;
       }
@@ -717,16 +752,32 @@ function connectWebSocket() {
     };
     
     websocket.onerror = (event) => {
-      const message = event?.error?.message || event?.message || event?.type || 'Unknown WebSocket error';
       const readyState = event?.target?.readyState;
       const url = event?.target?.url;
-
-      console.error('WebSocket error in background:', {
-        message,
+      const details = {
+        message: event?.error?.message || event?.message || event?.type || 'Unknown WebSocket error',
         readyState,
         url,
-        raw: event
-      });
+        wasClean: event?.wasClean,
+        code: event?.code,
+        reason: event?.reason
+      };
+
+      console.error(`WebSocket error in background: ${JSON.stringify(details)}`);
+
+      if (event?.error && event.error !== details.message) {
+        let errorDetails = event.error?.stack || event.error?.message || null;
+
+        if (!errorDetails) {
+          try {
+            errorDetails = JSON.stringify(event.error);
+          } catch (serializationError) {
+            errorDetails = String(event.error);
+          }
+        }
+
+        console.error('WebSocket error object:', errorDetails);
+      }
     };
     
     websocket.onclose = (event) => {
