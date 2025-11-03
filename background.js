@@ -7,6 +7,7 @@ const WEBSOCKET_URL = 'wss://stream.pushbullet.com/websocket/';
 const KEEP_ALIVE_ALARM_NAME = 'pushbulletKeepAlive';
 const KEEP_ALIVE_PERIOD_MINUTES = 1;
 const KEEP_ALIVE_REFRESH_INTERVAL_MS = 60000;
+const MAX_WEBSOCKET_RECONNECT_DELAY_MS = 30000;
 const textDecoder = typeof TextDecoder === 'function' ? new TextDecoder() : null;
 
 // Global variables
@@ -106,7 +107,7 @@ async function initializeSessionCache() {
       }
 
       // Auto-open any new link pushes that arrived while we were offline
-      processPushesForAutoOpen(pushes);
+      await processPushesForAutoOpen(pushes);
 
       // Update session cache
       sessionCache.isAuthenticated = true;
@@ -226,7 +227,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     chrome.storage.local.set({ autoOpenLinks: autoOpenLinks });
 
     if (autoOpenLinks) {
-      processPushesForAutoOpen(sessionCache.recentPushes);
+      processPushesForAutoOpen(sessionCache.recentPushes).catch(error => {
+        console.error('Error auto-opening queued pushes after toggle:', error);
+      });
     }
   } else if (message.action === 'deviceNicknameChanged') {
     // Update device nickname
@@ -312,7 +315,7 @@ async function refreshSessionCache() {
       const pushes = await fetchRecentPushes();
       sessionCache.recentPushes = pushes;
 
-      processPushesForAutoOpen(pushes);
+      await processPushesForAutoOpen(pushes);
 
       // Update session cache
       sessionCache.isAuthenticated = true;
@@ -609,16 +612,33 @@ async function updateDeviceNickname() {
 }
 
 // Connect to WebSocket
-function connectWebSocket() {
-  // Disconnect existing WebSocket if any
-  disconnectWebSocket();
-  
-  if (!apiKey) return;
-  
+function connectWebSocket(options = {}) {
+  const { forceReconnect = false } = options;
+
+  if (!apiKey) {
+    return;
+  }
+
+  const existingState = websocket ? websocket.readyState : WebSocket.CLOSED;
+
+  if (!forceReconnect && websocket && (existingState === WebSocket.OPEN || existingState === WebSocket.CONNECTING)) {
+    return;
+  }
+
+  if (websocket) {
+    disconnectWebSocket({ allowReconnect: false });
+  }
+
+  if (reconnectTimeout) {
+    clearTimeout(reconnectTimeout);
+    reconnectTimeout = null;
+  }
+
   try {
     const wsUrl = WEBSOCKET_URL + apiKey;
     websocket = new WebSocket(wsUrl);
-    
+    websocket.shouldAttemptReconnect = true;
+
     websocket.onopen = (event) => {
       console.log('Connected to Pushbullet WebSocket from background');
       reconnectAttempts = 0;
@@ -708,7 +728,7 @@ function connectWebSocket() {
               });
               
               // Check for any pushes that should trigger auto-open
-              processPushesForAutoOpen(pushes);
+              await processPushesForAutoOpen(pushes);
 
               // Show notification for the newest push (if available)
               if (pushes.length > 0) {
@@ -740,7 +760,7 @@ function connectWebSocket() {
             }
             
             // Auto-open if needed and show notification for the new push
-            processPushesForAutoOpen([data.push]);
+            await processPushesForAutoOpen([data.push]);
             showPushNotification(data.push);
           }
           break;
@@ -782,16 +802,28 @@ function connectWebSocket() {
     
     websocket.onclose = (event) => {
       console.log('Disconnected from Pushbullet WebSocket in background');
-      
-      // Try to reconnect with exponential backoff
-      const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
+
+      websocket = null;
+
+      const shouldReconnect = event?.target?.shouldAttemptReconnect !== false;
+
+      if (!shouldReconnect) {
+        reconnectAttempts = 0;
+        return;
+      }
+
+      const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), MAX_WEBSOCKET_RECONNECT_DELAY_MS);
       reconnectAttempts++;
-      
+
       console.log(`Reconnecting in ${delay}ms (attempt ${reconnectAttempts})`);
-      
+
+      if (reconnectTimeout) {
+        clearTimeout(reconnectTimeout);
+      }
+
       reconnectTimeout = setTimeout(() => {
         if (apiKey) {
-          connectWebSocket();
+          connectWebSocket({ forceReconnect: true });
         }
       }, delay);
     };
@@ -801,16 +833,28 @@ function connectWebSocket() {
 }
 
 // Disconnect WebSocket
-function disconnectWebSocket() {
+function disconnectWebSocket(options = {}) {
+  const { allowReconnect = false } = options;
+
   if (websocket) {
-    websocket.close();
-    websocket = null;
+    try {
+      websocket.shouldAttemptReconnect = allowReconnect;
+      websocket.close();
+    } catch (error) {
+      console.error('Error closing WebSocket in background:', error);
+    } finally {
+      websocket = null;
+    }
   }
   
   // Clear any pending reconnect timeout
   if (reconnectTimeout) {
     clearTimeout(reconnectTimeout);
     reconnectTimeout = null;
+  }
+
+  if (!allowReconnect) {
+    reconnectAttempts = 0;
   }
 }
 
@@ -822,7 +866,7 @@ async function refreshPushes() {
     sessionCache.lastUpdated = Date.now();
 
     // Process any pushes that should auto-open as part of this refresh
-    processPushesForAutoOpen(pushes);
+    await processPushesForAutoOpen(pushes);
 
     // Notify popup of updated pushes
     chrome.runtime.sendMessage({
@@ -841,7 +885,7 @@ async function refreshPushes() {
 }
 
 // Determine whether a push should trigger an auto-open and handle it if necessary
-function processPushesForAutoOpen(pushes) {
+async function processPushesForAutoOpen(pushes) {
   if (!autoOpenLinks || !pushes) {
     return;
   }
@@ -856,9 +900,11 @@ function processPushesForAutoOpen(pushes) {
   }
 
   // Open in chronological order so older pushes appear first when multiple queued up
-  pushesToOpen
-    .sort((a, b) => getPushTimestamp(a) - getPushTimestamp(b))
-    .forEach(openPushLink);
+  const sortedPushes = pushesToOpen.sort((a, b) => getPushTimestamp(a) - getPushTimestamp(b));
+
+  for (const push of sortedPushes) {
+    await openPushLink(push);
+  }
 }
 
 function shouldAutoOpenPush(push) {
@@ -898,14 +944,15 @@ function shouldAutoOpenPush(push) {
   return true;
 }
 
-function openPushLink(push) {
+async function openPushLink(push) {
   console.log('Auto-opening link:', push.url);
 
-  chrome.tabs.create({ url: push.url }, () => {
-    if (chrome.runtime.lastError) {
-      console.error('Error opening tab for push:', chrome.runtime.lastError);
-    }
-  });
+  try {
+    await chrome.tabs.create({ url: push.url, active: true });
+  } catch (error) {
+    console.error('Error opening tab for push:', error);
+    return;
+  }
 
   const pushTimestamp = getPushTimestamp(push);
   lastAutoOpenedPushTimestamp = Math.max(lastAutoOpenedPushTimestamp, pushTimestamp);
@@ -923,10 +970,14 @@ function openPushLink(push) {
     }
   }
 
-  chrome.storage.local.set({
-    lastAutoOpenedPushTimestamp,
-    autoOpenedPushIdens: autoOpenedPushIdensList
-  });
+  try {
+    await chrome.storage.local.set({
+      lastAutoOpenedPushTimestamp,
+      autoOpenedPushIdens: autoOpenedPushIdensList
+    });
+  } catch (error) {
+    console.error('Error persisting auto-open metadata:', error);
+  }
 }
 
 function getPushTimestamp(push) {
