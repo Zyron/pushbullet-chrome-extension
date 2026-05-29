@@ -60,9 +60,17 @@ async function initializeSessionCache() {
   console.log('Initializing session cache');
   
   try {
-    // Get API key from storage
+    // Get API key and cached session data from storage
     const result = await new Promise(resolve => {
-      chrome.storage.local.get(['apiKey', 'deviceIden', 'autoOpenLinks', 'deviceNickname', 'lastAutoOpenedPushTimestamp', 'autoOpenedPushIdens'], resolve);
+      chrome.storage.local.get([
+        'apiKey', 
+        'deviceIden', 
+        'autoOpenLinks', 
+        'deviceNickname', 
+        'lastAutoOpenedPushTimestamp', 
+        'autoOpenedPushIdens',
+        'sessionCache'
+      ], resolve);
     });
     
     apiKey = result.apiKey;
@@ -86,32 +94,55 @@ async function initializeSessionCache() {
       autoOpenedPushIdensList = result.autoOpenedPushIdens.slice(0, MAX_STORED_AUTO_OPENED_IDENS);
       autoOpenedPushIdens = new Set(autoOpenedPushIdensList);
     }
+
+    if (result.sessionCache) {
+      sessionCache = result.sessionCache;
+      console.log('Loaded cached session data from storage');
+    }
     
     if (apiKey) {
-      // Fetch user info
-      const userInfo = await fetchUserInfo();
-      sessionCache.userInfo = userInfo;
-      
-      // Fetch devices
-      const devices = await fetchDevices();
-      sessionCache.devices = devices;
-      
-      // Fetch recent pushes
-      const pushes = await fetchRecentPushes();
-      sessionCache.recentPushes = pushes;
+      // Check if session cache is missing or older than 30 seconds
+      const isStale = Date.now() - (sessionCache.lastUpdated || 0) > 30000;
+      const hasCachedData = sessionCache.userInfo && sessionCache.devices && sessionCache.recentPushes && sessionCache.recentPushes.length > 0;
 
-      // On first run, seed the last auto-open timestamp to avoid opening historical pushes
-      if (result.lastAutoOpenedPushTimestamp === undefined && pushes.length > 0) {
-        lastAutoOpenedPushTimestamp = getPushTimestamp(pushes[0]);
-        chrome.storage.local.set({ lastAutoOpenedPushTimestamp });
+      if ((isStale || !hasCachedData) && navigator.onLine) {
+        console.log('Session cache is stale or missing, fetching fresh data');
+        
+        // Fetch user info
+        const userInfo = await fetchUserInfo();
+        sessionCache.userInfo = userInfo;
+        
+        // Fetch devices
+        const devices = await fetchDevices();
+        sessionCache.devices = devices;
+        
+        // Fetch recent pushes
+        const pushes = await fetchRecentPushes();
+        sessionCache.recentPushes = pushes;
+
+        // On first run, seed the last auto-open timestamp to avoid opening historical pushes
+        if (result.lastAutoOpenedPushTimestamp === undefined && pushes.length > 0) {
+          lastAutoOpenedPushTimestamp = getPushTimestamp(pushes[0]);
+          chrome.storage.local.set({ lastAutoOpenedPushTimestamp });
+        }
+
+        // Auto-open any new link pushes that arrived while we were offline
+        await processPushesForAutoOpen(pushes);
+
+        // Update session cache
+        sessionCache.isAuthenticated = true;
+        sessionCache.lastUpdated = Date.now();
+
+        // Persist session cache to storage
+        await chrome.storage.local.set({ sessionCache });
+      } else {
+        const ageSec = Math.round((Date.now() - (sessionCache.lastUpdated || 0)) / 1000);
+        console.log(`Using cached session data (age: ${ageSec}s, offline: ${!navigator.onLine})`);
+        
+        if (sessionCache.recentPushes) {
+          await processPushesForAutoOpen(sessionCache.recentPushes);
+        }
       }
-
-      // Auto-open any new link pushes that arrived while we were offline
-      await processPushesForAutoOpen(pushes);
-
-      // Update session cache
-      sessionCache.isAuthenticated = true;
-      sessionCache.lastUpdated = Date.now();
       
       // Register device if needed
       await registerDevice();
@@ -124,7 +155,11 @@ async function initializeSessionCache() {
       console.log('Device nickname:', deviceNickname);
     }
   } catch (error) {
-    console.error('Error initializing session cache:', error);
+    if (!navigator.onLine || error.message.includes('Failed to fetch')) {
+      console.warn('Network issue initializing session cache (possibly offline):', error.message);
+    } else {
+      console.error('Error initializing session cache:', error);
+    }
     sessionCache.isAuthenticated = false;
   }
 }
@@ -260,10 +295,19 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     return;
   }
 
+  if (!navigator.onLine) {
+    console.log('Keep-alive alarm skipped: offline');
+    return;
+  }
+
   if (!sessionCache.isAuthenticated) {
     console.log('Keep-alive alarm reinitializing session cache');
     initializeSessionCache().catch(error => {
-      console.error('Error reinitializing session cache from keep-alive alarm:', error);
+      if (!navigator.onLine || error.message.includes('Failed to fetch')) {
+        console.warn('Network issue reinitializing session cache from keep-alive alarm (possibly offline):', error.message);
+      } else {
+        console.error('Error reinitializing session cache from keep-alive alarm:', error);
+      }
     });
     return;
   }
@@ -291,7 +335,11 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   try {
     await refreshPushes();
   } catch (error) {
-    console.error('Error refreshing pushes during keep-alive:', error);
+    if (!navigator.onLine || error.message.includes('Failed to fetch')) {
+      console.warn('Network issue refreshing pushes during keep-alive (possibly offline):', error.message);
+    } else {
+      console.error('Error refreshing pushes during keep-alive:', error);
+    }
   } finally {
     keepAliveRefreshInProgress = false;
   }
@@ -300,6 +348,11 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 // Refresh session cache
 async function refreshSessionCache() {
   console.log('Refreshing session cache');
+  
+  if (!navigator.onLine) {
+    console.log('Skipping session cache refresh: offline');
+    return false;
+  }
   
   try {
     if (apiKey) {
@@ -321,6 +374,9 @@ async function refreshSessionCache() {
       sessionCache.isAuthenticated = true;
       sessionCache.lastUpdated = Date.now();
       
+      // Save session cache to local storage
+      await chrome.storage.local.set({ sessionCache });
+
       // Connect to WebSocket if not connected
       if (!websocket || websocket.readyState !== WebSocket.OPEN) {
         connectWebSocket();
@@ -332,7 +388,11 @@ async function refreshSessionCache() {
       return false;
     }
   } catch (error) {
-    console.error('Error refreshing session cache:', error);
+    if (!navigator.onLine || error.message.includes('Failed to fetch')) {
+      console.warn('Network issue refreshing session cache (possibly offline):', error.message);
+    } else {
+      console.error('Error refreshing session cache:', error);
+    }
     sessionCache.isAuthenticated = false;
     throw error;
   }
@@ -565,7 +625,18 @@ async function updateDeviceNickname() {
     return;
   }
   
+  if (!navigator.onLine) {
+    console.log('Skipping device nickname update: offline');
+    return;
+  }
+  
   try {
+    const result = await chrome.storage.local.get(['lastSyncedDeviceNickname']);
+    if (result.lastSyncedDeviceNickname === deviceNickname) {
+      console.log('Device nickname is already in sync with server:', deviceNickname);
+      return;
+    }
+
     console.log('Updating device nickname to:', deviceNickname);
     
     // Update device
@@ -587,11 +658,15 @@ async function updateDeviceNickname() {
     }
     
     console.log('Device nickname updated successfully');
+    await chrome.storage.local.set({ lastSyncedDeviceNickname: deviceNickname });
     
     // Refresh devices in session cache
     const devices = await fetchDevices();
     sessionCache.devices = devices;
     sessionCache.lastUpdated = Date.now();
+    
+    // Save updated session cache to local storage
+    await chrome.storage.local.set({ sessionCache });
     
     // Notify popup of updated devices
     chrome.runtime.sendMessage({
@@ -607,7 +682,11 @@ async function updateDeviceNickname() {
       console.log('No popup open to receive device updates');
     });
   } catch (error) {
-    console.error('Error updating device nickname:', error);
+    if (!navigator.onLine || error.message.includes('Failed to fetch')) {
+      console.warn('Network issue updating device nickname (possibly offline):', error.message);
+    } else {
+      console.error('Error updating device nickname:', error);
+    }
   }
 }
 
@@ -616,6 +695,11 @@ function connectWebSocket(options = {}) {
   const { forceReconnect = false } = options;
 
   if (!apiKey) {
+    return;
+  }
+
+  if (!navigator.onLine) {
+    console.log('Skipping WebSocket connection: offline');
     return;
   }
 
@@ -860,10 +944,18 @@ function disconnectWebSocket(options = {}) {
 
 // Refresh pushes
 async function refreshPushes() {
+  if (!navigator.onLine) {
+    console.log('Skipping refresh pushes: offline');
+    return sessionCache.recentPushes;
+  }
+
   try {
     const pushes = await fetchRecentPushes();
     sessionCache.recentPushes = pushes;
     sessionCache.lastUpdated = Date.now();
+
+    // Save session cache to local storage
+    await chrome.storage.local.set({ sessionCache });
 
     // Process any pushes that should auto-open as part of this refresh
     await processPushesForAutoOpen(pushes);
@@ -879,7 +971,11 @@ async function refreshPushes() {
     
     return pushes;
   } catch (error) {
-    console.error('Error refreshing pushes:', error);
+    if (!navigator.onLine || error.message.includes('Failed to fetch')) {
+      console.warn('Network issue refreshing pushes (possibly offline):', error.message);
+    } else {
+      console.error('Error refreshing pushes:', error);
+    }
     throw error;
   }
 }
@@ -1193,6 +1289,9 @@ chrome.storage.onChanged.addListener((changes, namespace) => {
         lastAutoOpenedPushTimestamp = 0;
         autoOpenedPushIdens.clear();
         autoOpenedPushIdensList = [];
+
+        // Clear cached storage fields
+        chrome.storage.local.remove(['sessionCache', 'lastSyncedDeviceNickname']);
       }
     }
     
