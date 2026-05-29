@@ -423,7 +423,7 @@ async function pushLink(url, title) {
       body: JSON.stringify({
         type: 'link',
         title: title || url,
-        url: url,
+        url: normalizeUrl(url),
         source_device_iden: deviceIden
       })
     });
@@ -945,10 +945,11 @@ function shouldAutoOpenPush(push) {
 }
 
 async function openPushLink(push) {
-  console.log('Auto-opening link:', push.url);
+  const url = normalizeUrl(push.url);
+  console.log('Auto-opening link:', url);
 
   try {
-    await chrome.tabs.create({ url: push.url, active: true });
+    await chrome.tabs.create({ url: url, active: true });
   } catch (error) {
     console.error('Error opening tab for push:', error);
     return;
@@ -987,6 +988,28 @@ function getPushTimestamp(push) {
 
   // "modified" is updated whenever the push changes, fall back to created time
   return push.modified || push.created || 0;
+}
+
+// Normalize URL by prepending scheme if missing
+function normalizeUrl(url) {
+  if (!url) {
+    return '';
+  }
+
+  const trimmed = url.trim();
+
+  // Check if URL has a valid scheme or is protocol-relative
+  const hasScheme = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(trimmed) || /^(mailto|tel|sms|magnet):/i.test(trimmed);
+
+  if (hasScheme) {
+    return trimmed;
+  }
+
+  if (trimmed.startsWith('//')) {
+    return 'https:' + trimmed;
+  }
+
+  return 'https://' + trimmed;
 }
 
 // Show notification for a push
@@ -1065,8 +1088,9 @@ chrome.notifications.onClicked.addListener((notificationId) => {
           
           // If it's a link, also open it in a new tab
           if (push.type === 'link' && push.url) {
-            console.log('Opening link in new tab:', push.url);
-            chrome.tabs.create({ url: push.url });
+            const url = normalizeUrl(push.url);
+            console.log('Opening link in new tab:', url);
+            chrome.tabs.create({ url: url });
           }
         });
         

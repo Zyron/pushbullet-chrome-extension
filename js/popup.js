@@ -605,7 +605,7 @@ function displayPushes(pushes) {
     
     if (push.url) {
       const url = document.createElement('a');
-      url.href = push.url;
+      url.href = normalizeUrl(push.url);
       url.target = '_blank';
       url.className = 'push-url';
       url.textContent = push.url;
@@ -641,6 +641,28 @@ function formatTimestamp(date) {
   } else {
     return 'just now';
   }
+}
+
+// Normalize URL by prepending scheme if missing
+function normalizeUrl(url) {
+  if (!url) {
+    return '';
+  }
+
+  const trimmed = url.trim();
+
+  // Check if URL has a valid scheme or is protocol-relative
+  const hasScheme = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(trimmed) || /^(mailto|tel|sms|magnet):/i.test(trimmed);
+
+  if (hasScheme) {
+    return trimmed;
+  }
+
+  if (trimmed.startsWith('//')) {
+    return 'https:' + trimmed;
+  }
+
+  return 'https://' + trimmed;
 }
 
 // Toggle between push types
@@ -693,13 +715,15 @@ async function sendPush() {
       }
     } else if (pushType === 'link') {
       pushData.title = linkTitleInput.value.trim();
-      pushData.url = linkUrlInput.value.trim();
-      pushData.body = linkBodyInput.value.trim();
+      const rawUrl = linkUrlInput.value.trim();
       
-      if (!pushData.url) {
+      if (!rawUrl) {
         showStatus('Please enter a URL for the link.', 'error');
         return;
       }
+      
+      pushData.url = normalizeUrl(rawUrl);
+      pushData.body = linkBodyInput.value.trim();
     }
     
     // Send push
