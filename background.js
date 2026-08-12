@@ -23,6 +23,7 @@ const MAX_STORED_AUTO_OPENED_IDENS = 50;
 let autoOpenedPushIdens = new Set();
 let autoOpenedPushIdensList = [];
 let keepAliveRefreshInProgress = false;
+let sessionInitializationPromise = null;
 
 // Session cache for quick popup loading
 let sessionCache = {
@@ -48,15 +49,26 @@ chrome.runtime.onInstalled.addListener(() => {
 // Initialize session cache when Chrome starts
 chrome.runtime.onStartup.addListener(() => {
   ensureKeepAliveAlarm();
-  initializeSessionCache();
+  void initializeSessionCache();
 });
 
 // Ensure session cache is initialized when the service worker is loaded
-initializeSessionCache();
+void initializeSessionCache();
 ensureKeepAliveAlarm();
 
 // Initialize session cache
-async function initializeSessionCache() {
+function initializeSessionCache() {
+  if (!sessionInitializationPromise) {
+    sessionInitializationPromise = initializeSessionCacheInternal()
+      .finally(() => {
+        sessionInitializationPromise = null;
+      });
+  }
+
+  return sessionInitializationPromise;
+}
+
+async function initializeSessionCacheInternal() {
   console.log('Initializing session cache');
   
   try {
@@ -121,13 +133,17 @@ async function initializeSessionCache() {
         sessionCache.recentPushes = pushes;
 
         // On first run, seed the last auto-open timestamp to avoid opening historical pushes
-        if (result.lastAutoOpenedPushTimestamp === undefined && pushes.length > 0) {
+        const isFirstAutoOpenSync = result.lastAutoOpenedPushTimestamp === undefined;
+
+        if (isFirstAutoOpenSync && pushes.length > 0) {
           lastAutoOpenedPushTimestamp = getPushTimestamp(pushes[0]);
-          chrome.storage.local.set({ lastAutoOpenedPushTimestamp });
+          await chrome.storage.local.set({ lastAutoOpenedPushTimestamp });
         }
 
         // Auto-open any new link pushes that arrived while we were offline
-        await processPushesForAutoOpen(pushes);
+        if (!isFirstAutoOpenSync) {
+          await processPushesForAutoOpen(pushes);
+        }
 
         // Update session cache
         sessionCache.isAuthenticated = true;
@@ -988,18 +1004,14 @@ async function processPushesForAutoOpen(pushes) {
 
   const pushArray = Array.isArray(pushes) ? pushes : [pushes];
 
-  // Collect pushes that qualify for auto-opening and haven't been handled yet
-  const pushesToOpen = pushArray.filter(shouldAutoOpenPush);
-
-  if (pushesToOpen.length === 0) {
-    return;
-  }
-
   // Open in chronological order so older pushes appear first when multiple queued up
-  const sortedPushes = pushesToOpen.sort((a, b) => getPushTimestamp(a) - getPushTimestamp(b));
+  const sortedPushes = [...pushArray].sort((a, b) => getPushTimestamp(a) - getPushTimestamp(b));
 
   for (const push of sortedPushes) {
-    await openPushLink(push);
+    // Re-check after each push because opening it records its iden and timestamp.
+    if (shouldAutoOpenPush(push)) {
+      await openPushLink(push);
+    }
   }
 }
 
@@ -1033,7 +1045,8 @@ function shouldAutoOpenPush(push) {
   const pushTimestamp = getPushTimestamp(push);
 
   // Skip pushes we've already processed
-  if (pushTimestamp < lastAutoOpenedPushTimestamp) {
+  if (pushTimestamp < lastAutoOpenedPushTimestamp ||
+      (!push.iden && pushTimestamp === lastAutoOpenedPushTimestamp)) {
     return false;
   }
 
