@@ -24,6 +24,7 @@ let autoOpenedPushIdens = new Set();
 let autoOpenedPushIdensList = [];
 let keepAliveRefreshInProgress = false;
 let sessionInitializationPromise = null;
+let autoOpenProcessingQueue = Promise.resolve();
 
 // Session cache for quick popup loading
 let sessionCache = {
@@ -997,15 +998,31 @@ async function refreshPushes() {
 }
 
 // Determine whether a push should trigger an auto-open and handle it if necessary
-async function processPushesForAutoOpen(pushes) {
+function processPushesForAutoOpen(pushes) {
+  // Multiple event sources can report the same push at nearly the same time.
+  // Serialize all auto-open work so one caller records a push before the next
+  // caller checks whether it has already been handled.
+  const queuedPushes = Array.isArray(pushes) ? [...pushes] : [pushes];
+  const processingPromise = autoOpenProcessingQueue.then(() =>
+    processPushesForAutoOpenInternal(queuedPushes)
+  );
+
+  // Keep the queue usable after an error while preserving the error for the
+  // caller that initiated this processing attempt.
+  autoOpenProcessingQueue = processingPromise.catch(error => {
+    console.error('Error processing pushes for auto-open:', error);
+  });
+
+  return processingPromise;
+}
+
+async function processPushesForAutoOpenInternal(pushes) {
   if (!autoOpenLinks || !pushes) {
     return;
   }
 
-  const pushArray = Array.isArray(pushes) ? pushes : [pushes];
-
   // Open in chronological order so older pushes appear first when multiple queued up
-  const sortedPushes = [...pushArray].sort((a, b) => getPushTimestamp(a) - getPushTimestamp(b));
+  const sortedPushes = [...pushes].sort((a, b) => getPushTimestamp(a) - getPushTimestamp(b));
 
   for (const push of sortedPushes) {
     // Re-check after each push because opening it records its iden and timestamp.
